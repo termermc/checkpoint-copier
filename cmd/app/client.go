@@ -6,10 +6,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
+	"time"
 )
 
 // Client entrypoint.
@@ -53,6 +56,33 @@ func clientMain(inputPath string) {
 
 	toDl := make(chan SimpleDirEntry, 100_000_000)
 
+	// Handle graceful shutdowns.
+	termSigs := make(chan os.Signal, 1)
+	signal.Notify(termSigs, os.Interrupt, syscall.SIGTERM)
+	var shouldTerminate atomic.Bool
+	shouldTerminate.Store(false)
+	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Catch panic from close(toDl) race condition.
+			}
+
+			// Consume all remaining entries.
+			for range toDl {
+			}
+		}()
+
+		<-termSigs
+		shouldTerminate.Store(true)
+		println("Waiting for downloads to end...")
+
+		close(toDl)
+	}()
+
+	// Values to calculate percent done
+	var totalSize int64
+	var progSize int64
+
 	go func() {
 		println("Connecting to server to get its snapshot...")
 		if strings.Contains(serverAddr, ":") {
@@ -84,6 +114,7 @@ func clientMain(inputPath string) {
 						panic(fmt.Sprintf("failed to mkdir \"%s\": %v", clientPath, err))
 					}
 				} else {
+					atomic.AddInt64(&totalSize, entry.FileSize)
 					toDl <- entry
 				}
 			}
@@ -95,8 +126,11 @@ func clientMain(inputPath string) {
 		if !gotAny {
 			panic("Server returned empty snapshot")
 		}
+		println("Finished receiving snapshot from server")
 
-		close(toDl)
+		if !shouldTerminate.Load() {
+			close(toDl)
+		}
 	}()
 
 	var completeCount int64
@@ -127,7 +161,11 @@ func clientMain(inputPath string) {
 				_ = destFile.Close()
 			}()
 
-			fmt.Printf("DL: %s\n", entry.RelativePath)
+			progSz := atomic.LoadInt64(&progSize)
+			totalSz := atomic.LoadInt64(&totalSize)
+
+			percentAfterDl := (float64(progSz) / float64(totalSz)) * 100
+			fmt.Printf("DL (%.4f%% %s/%s) %s\n", percentAfterDl, FormatFileSize(progSz), FormatFileSize(totalSz), entry.RelativePath)
 
 			//goland:noinspection HttpUrlsUsage
 			reqUrl, _ := url.Parse(fmt.Sprintf("http://%s/download?path=%s", serverBase.Host, url.QueryEscape(entry.RelativePath)))
@@ -150,7 +188,7 @@ func clientMain(inputPath string) {
 			fileLenStr := fileRes.Header.Get("Content-Length")
 			fileLen, err := strconv.ParseInt(fileLenStr, 10, 64)
 			if fileLen != entry.FileSize {
-				_, _ = fmt.Fprintf(os.Stderr, "expected to get file of size %d but server sent %d, discarding", entry.FileSize, fileLen)
+				_, _ = fmt.Fprintf(os.Stderr, "expected to get file of size %d for file \"%s\" but server sent %d, discarding\n", entry.FileSize, entry.RelativePath, fileLen)
 				atomic.AddInt64(&failedCount, 1)
 
 				// Delete destination file
@@ -173,11 +211,22 @@ func clientMain(inputPath string) {
 				return
 			}
 
+			atomic.AddInt64(&progSize, entry.FileSize)
 			atomic.AddInt64(&completeCount, 1)
 		}()
 	}
 
+	// Wait for pending downloads to finish by polling channel to check if there are some HTTP clients still in use.
+	for len(httpChan) != int(dlCount) {
+		time.Sleep(time.Millisecond * 100)
+	}
+
 	fmt.Printf("Completed %d, failed %d\n", completeCount, failedCount)
+	if shouldTerminate.Load() {
+		println("Skipping re-snapshotting. You should snapshot before running again.")
+		return
+	}
+
 	println("Retaking snapshot...")
 	if _, err := SnapshotDir(inputPath); err != nil {
 		panic(err)
