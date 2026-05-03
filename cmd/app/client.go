@@ -151,6 +151,16 @@ func clientMain(inputPath string) {
 			}()
 
 			destPath := filepath.Join(inputPath, entry.RelativePath)
+			destDir := filepath.Dir(destPath)
+
+			// Create containing directory if it does not already exist.
+			err = os.MkdirAll(destDir, entry.Mode)
+			if err != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "failed to create dir \"%s\": %v\n", destDir, err)
+				atomic.AddInt64(&failedCount, 1)
+				return
+			}
+
 			destFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY, entry.Mode)
 			if err != nil {
 				_, _ = fmt.Fprintf(os.Stderr, "failed to open dest file \"%s\" for writing: %v\n", destPath, err)
